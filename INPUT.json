@@ -1,0 +1,19 @@
+{
+    "url": "https://www.swiggy.com/city/bangalore",
+    "keyword": "biryani",
+    "location": "Bangalore",
+    "resultsWanted": 20,
+    "maxPages": 2,
+    "proxyConfiguration": {
+        "useApifyProxy": true
+    }
+}
+
+
+
+
+
+
+
+
+

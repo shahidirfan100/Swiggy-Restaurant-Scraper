@@ -1,0 +1,114 @@
+{
+    "actorSpecification": 1,
+    "fields": {
+        "restaurantId": {
+            "title": "Restaurant ID",
+            "type": "string",
+            "description": "Swiggy restaurant identifier"
+        },
+        "name": {
+            "title": "Name",
+            "type": "string",
+            "description": "Restaurant name"
+        },
+        "url": {
+            "title": "URL",
+            "type": "string",
+            "description": "Restaurant URL"
+        },
+        "city": {
+            "title": "City",
+            "type": "string",
+            "description": "Resolved city name"
+        },
+        "locality": {
+            "title": "Locality",
+            "type": "string",
+            "description": "Restaurant locality"
+        },
+        "areaName": {
+            "title": "Area",
+            "type": "string",
+            "description": "Restaurant area"
+        },
+        "cuisines": {
+            "title": "Cuisines",
+            "type": "array",
+            "description": "Cuisine tags"
+        },
+        "costForTwo": {
+            "title": "Cost For Two",
+            "type": "string",
+            "description": "Cost for two as shown by Swiggy"
+        },
+        "avgRating": {
+            "title": "Average Rating",
+            "type": "number",
+            "description": "Average rating"
+        },
+        "deliveryTime": {
+            "title": "Delivery Time",
+            "type": "integer",
+            "description": "Estimated delivery time in minutes"
+        },
+        "sourceType": {
+            "title": "Source Type",
+            "type": "string",
+            "description": "Whether the record came from a city listing or a keyword search"
+        }
+    },
+    "views": {
+        "overview": {
+            "title": "Overview",
+            "transformation": {
+                "fields": [
+                    "restaurantId",
+                    "name",
+                    "city",
+                    "areaName",
+                    "cuisines",
+                    "avgRating",
+                    "deliveryTime",
+                    "url"
+                ]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "restaurantId": {
+                        "label": "Restaurant ID",
+                        "format": "text"
+                    },
+                    "name": {
+                        "label": "Name",
+                        "format": "text"
+                    },
+                    "city": {
+                        "label": "City",
+                        "format": "text"
+                    },
+                    "areaName": {
+                        "label": "Area",
+                        "format": "text"
+                    },
+                    "cuisines": {
+                        "label": "Cuisines",
+                        "format": "text"
+                    },
+                    "avgRating": {
+                        "label": "Rating",
+                        "format": "number"
+                    },
+                    "deliveryTime": {
+                        "label": "Delivery Time",
+                        "format": "number"
+                    },
+                    "url": {
+                        "label": "URL",
+                        "format": "link"
+                    }
+                }
+            }
+        }
+    }
+}

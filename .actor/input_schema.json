@@ -1,0 +1,58 @@
+{
+    "title": "Swiggy Restaurant Scraper",
+    "description": "Collect Swiggy restaurant data from city pages or keyword searches. Provide a Swiggy city URL for the strongest pagination support, or provide a location with a keyword search.",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "url": {
+            "title": "Swiggy URL",
+            "type": "string",
+            "description": "A Swiggy city or city collection URL such as https://www.swiggy.com/city/bangalore or https://www.swiggy.com/city/bangalore/best-restaurants.",
+            "editor": "textfield",
+            "prefill": "https://www.swiggy.com/city/bangalore"
+        },
+        "keyword": {
+            "title": "Keyword",
+            "type": "string",
+            "description": "Restaurant or dish keyword to search around the resolved city, such as biryani or pizza.",
+            "editor": "textfield",
+            "prefill": "biryani"
+        },
+        "location": {
+            "title": "Location",
+            "type": "string",
+            "description": "Location to geocode when you are not using a Swiggy URL, such as Bangalore or Koramangala Bangalore.",
+            "editor": "textfield",
+            "prefill": "Bangalore"
+        },
+        "resultsWanted": {
+            "title": "Results Wanted",
+            "type": "integer",
+            "description": "Maximum number of restaurants to collect.",
+            "minimum": 1,
+            "default": 20,
+            "prefill": 20,
+            "editor": "number"
+        },
+        "maxPages": {
+            "title": "Max Pages",
+            "type": "integer",
+            "description": "Maximum number of Swiggy pages to advance in URL mode when Show More is available.",
+            "minimum": 1,
+            "default": 3,
+            "prefill": 3,
+            "editor": "number"
+        },
+        "proxyConfiguration": {
+            "title": "Proxy Configuration",
+            "type": "object",
+            "description": "Apify proxy configuration. Residential proxies are recommended for the most stable browser-assisted pagination.",
+            "editor": "proxy",
+            "default": {
+                "useApifyProxy": true
+            }
+        }
+    },
+    "required": [],
+    "additionalProperties": false
+}
