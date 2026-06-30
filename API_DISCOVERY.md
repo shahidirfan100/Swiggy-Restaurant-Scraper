@@ -10,12 +10,16 @@
 
 ## Secondary API
 
-- Endpoint: `https://www.swiggy.com/dapi/restaurants/search/v3?lat=<lat>&lng=<lng>&str=<keyword>&trackingId=undefined&submitAction=ENTER`
+- Endpoint: `https://www.swiggy.com/dapi/restaurants/search/v3?lat=<lat>&lng=<lng>&str=<keyword>&trackingId=undefined&submitAction=ENTER&selectedPLTab=RESTAURANT`
 - Method: `GET`
 - Auth: none
-- Pagination: no working direct continuation parameter was confirmed, but a single response already returns a large search result payload
-- Fields available: dish match data plus embedded restaurant metadata for every hit
-- Use in actor: keyword mode, with restaurant deduplication and matched-dish enrichment
+- Pagination: no working direct continuation parameter was confirmed, but a single response already returns a large restaurant result payload
+- Fields available: restaurant metadata for keyword hits, including ids, names, location fields, cuisines, ratings, delivery SLA, pricing hints, badges, discount summaries, and restaurant URL context
+- Use in actor: keyword mode, with restaurant deduplication. `selectedPLTab=DISH` is used only as optional matched-dish enrichment because the default search tab can shift to dish-only results.
+
+## Failure Diagnosis Notes
+
+- 2026-06-30: A failing run returned zero records because the default keyword search response shifted to the dish tab. Direct `got-scraping` tests showed `selectedPLTab=RESTAURANT` returns restaurant cards and `selectedPLTab=DISH` returns dish cards. The actor now requests the restaurant tab first, logs response-shape keys when expected cards are missing, and falls back to city listing results if keyword cards shift again.
 
 ## Browser-Assisted Fallback
 

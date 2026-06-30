@@ -33,7 +33,7 @@ Build restaurant lists for outreach, partnerships, or account mapping. The datas
 | `location` | String | No | `"Bangalore"` | Fallback location when you are not using a Swiggy URL. |
 | `resultsWanted` | Integer | No | `20` | Maximum number of restaurants to save. |
 | `maxPages` | Integer | No | `3` | Maximum number of page expansions in URL mode when more city results are available. |
-| `proxyConfiguration` | Object | No | `{"useApifyProxy": true}` | Apify proxy configuration. |
+| `proxyConfiguration` | Object | No | `{"useApifyProxy": false}` | Apify proxy configuration. |
 
 ## Output Data
 

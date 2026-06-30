@@ -3,9 +3,9 @@
     "keyword": "biryani",
     "location": "Bangalore",
     "resultsWanted": 20,
-    "maxPages": 2,
+    "maxPages": 3,
     "proxyConfiguration": {
-        "useApifyProxy": true
+        "useApifyProxy": false
     }
 }
 
