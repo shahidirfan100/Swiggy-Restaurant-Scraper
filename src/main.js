@@ -1,8 +1,7 @@
 import { readFile } from 'node:fs/promises';
 
 import { Actor, log } from 'apify';
-import { gotScraping } from 'got-scraping';
-import { firefox } from 'playwright';
+import { Impit } from 'impit';
 
 const SWIGGY_BASE_URL = 'https://www.swiggy.com';
 const SWIGGY_LISTING_ENDPOINT = `${SWIGGY_BASE_URL}/dapi/restaurants/list/v5`;
@@ -10,41 +9,19 @@ const SWIGGY_SEARCH_ENDPOINT = `${SWIGGY_BASE_URL}/dapi/restaurants/search/v3`;
 const NOMINATIM_ENDPOINT = 'https://nominatim.openstreetmap.org/search';
 const DEFAULT_RESULTS_WANTED = 20;
 const DEFAULT_MAX_PAGES = 3;
-const FIREFOX_USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 15.7; rv:147.0) Gecko/20100101 Firefox/147.0',
-    'Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0',
-];
-const BROWSER_HEADER_PROFILES = [
-    {
-        'User-Agent': FIREFOX_USER_AGENTS[0],
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-    },
-    {
-        'User-Agent': FIREFOX_USER_AGENTS[1],
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-    },
-    {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
-        'sec-ch-ua': '"Chromium";v="145", "Google Chrome";v="145", "Not A(Brand";v="24"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-    },
-];
-const GEOCODER_USER_AGENT = 'swiggy-restaurant-scraper/1.0 (apify actor)';
-const TRACKER_PATTERNS = ['google-analytics', 'googletagmanager', 'doubleclick', 'adsense', 'facebook'];
+const KEYWORD_ONLY_LOCATION = 'Bangalore';
+const MAX_REQUEST_ATTEMPTS = 3;
+const REQUEST_TIMEOUT_MS = 30000;
+const MAX_RETRY_DELAY_MS = 10000;
 
 await Actor.main(async () => {
     try {
         const input = await getRuntimeInput();
         const normalizedInput = normalizeInput(input);
+
+        if (normalizedInput.keyword && !normalizedInput.url && !normalizedInput.location) {
+            normalizedInput.location = await getKeywordLocationFallback();
+        }
 
         if (!normalizedInput.url && !normalizedInput.location) {
             throw new Error('Provide either "url" or "location".');
@@ -55,10 +32,18 @@ await Actor.main(async () => {
             : undefined;
         const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
 
+        // One shared impit client handles TLS + header fingerprinting and
+        // connection pooling across all requests.
+        const client = new Impit({
+            browser: 'chrome',
+            ignoreTlsErrors: true,
+            ...(proxyUrl && { proxyUrl }),
+        });
+
         const resolvedLocation = await resolveLocation({
             url: normalizedInput.url,
             location: normalizedInput.location,
-            proxyUrl,
+            client,
         });
 
         const refererUrl = normalizedInput.url || buildCityUrl(resolvedLocation.citySlug);
@@ -69,15 +54,14 @@ await Actor.main(async () => {
                 keyword: normalizedInput.keyword,
                 maxPages: normalizedInput.maxPages,
                 resultsWanted: normalizedInput.resultsWanted,
-                proxyUrl,
+                client,
                 refererUrl,
                 resolvedLocation,
             });
         } else {
             records = await fetchCityResults({
                 maxPages: normalizedInput.maxPages,
-                pageUrl: normalizedInput.url,
-                proxyUrl,
+                client,
                 refererUrl,
                 resolvedLocation,
                 resultsWanted: normalizedInput.resultsWanted,
@@ -116,24 +100,44 @@ async function getRuntimeInput() {
 }
 
 function hasUserProvidedInput(input) {
-    const normalizedInput = normalizeInput(input || {});
-    return Boolean(normalizedInput.url || normalizedInput.location || normalizedInput.keyword);
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return false;
+
+    return Object.values(input).some((value) => {
+        if (typeof value === 'string') return Boolean(value.trim());
+        if (Array.isArray(value)) return value.length > 0;
+        if (value && typeof value === 'object') return Object.keys(value).length > 0;
+        return value !== undefined && value !== null;
+    });
 }
 
 function normalizeInput(input) {
     const normalizedInput = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+    const url = normalizeUrlValue(
+        pickFirstValue(normalizedInput, ['url', 'startUrl', 'start_url', 'startURL'])
+        || extractStartUrlsValue(pickFirstValue(normalizedInput, ['startUrls', 'start_urls'])),
+    );
+    const keyword = asNonEmptyString(pickFirstValue(normalizedInput, ['keyword', 'query', 'search', 'searchTerm', 'term']));
+    const location = asNonEmptyString(pickFirstValue(normalizedInput, ['location', 'city', 'cityName', 'city_name', 'place']));
 
     return {
-        url: asNonEmptyString(
-            pickFirstValue(normalizedInput, ['url', 'startUrl', 'start_url', 'startURL'])
-            || extractStartUrlsValue(pickFirstValue(normalizedInput, ['startUrls', 'start_urls'])),
-        ),
-        keyword: asNonEmptyString(pickFirstValue(normalizedInput, ['keyword', 'query', 'search', 'searchTerm', 'term'])),
-        location: asNonEmptyString(pickFirstValue(normalizedInput, ['location', 'city', 'cityName', 'city_name', 'place'])),
+        url,
+        keyword,
+        location,
         resultsWanted: toPositiveInteger(pickFirstValue(normalizedInput, ['resultsWanted', 'results_wanted']), DEFAULT_RESULTS_WANTED),
         maxPages: toPositiveInteger(pickFirstValue(normalizedInput, ['maxPages', 'max_pages']), DEFAULT_MAX_PAGES),
         proxyConfiguration: pickFirstValue(normalizedInput, ['proxyConfiguration', 'proxy_configuration']),
     };
+}
+
+function getKeywordLocationFallback() {
+    return KEYWORD_ONLY_LOCATION;
+}
+
+function normalizeUrlValue(value) {
+    const normalizedValue = asNonEmptyString(value);
+    if (!normalizedValue) return undefined;
+
+    return asNonEmptyString(normalizedValue.replace(/^["'(<]+|[>"')]+$/g, ''));
 }
 
 function pickFirstValue(input, keys) {
@@ -195,7 +199,7 @@ function toPositiveInteger(value, fallback) {
     return Math.floor(numericValue);
 }
 
-async function resolveLocation({ url, location, proxyUrl }) {
+async function resolveLocation({ url, location, client }) {
     const parsedUrl = url ? parseSwiggyUrl(url) : undefined;
     const query = parsedUrl?.cityName || location;
 
@@ -205,7 +209,7 @@ async function resolveLocation({ url, location, proxyUrl }) {
 
     const resolvedByGeocoder = await geocodeLocation({
         query,
-        proxyUrl,
+        client,
         preferCityLookup: Boolean(parsedUrl?.cityName && !location),
     });
     if (resolvedByGeocoder) {
@@ -216,13 +220,6 @@ async function resolveLocation({ url, location, proxyUrl }) {
             lng: resolvedByGeocoder.lng,
             boundingBox: resolvedByGeocoder.boundingBox,
         };
-    }
-
-    if (url) {
-        const browserLocation = await resolveLocationFromBrowser(url, proxyUrl);
-        if (browserLocation) {
-            return browserLocation;
-        }
     }
 
     throw new Error(`Could not resolve coordinates for "${query}".`);
@@ -236,7 +233,8 @@ function parseSwiggyUrl(url) {
         throw new Error('The provided url is not a valid URL.');
     }
 
-    if (!/swiggy\.com$/i.test(parsed.hostname)) {
+    const hostname = parsed.hostname.toLowerCase().replace(/\.$/, '');
+    if (!['swiggy.com', 'www.swiggy.com'].includes(hostname)) {
         throw new Error('The provided url must point to swiggy.com.');
     }
 
@@ -252,7 +250,7 @@ function parseSwiggyUrl(url) {
     };
 }
 
-async function geocodeLocation({ query, proxyUrl, preferCityLookup }) {
+async function geocodeLocation({ query, client, preferCityLookup }) {
     const requestGeocode = async (params) => {
         const geocodingUrl = new URL(NOMINATIM_ENDPOINT);
         geocodingUrl.searchParams.set('format', 'jsonv2');
@@ -262,21 +260,8 @@ async function geocodeLocation({ query, proxyUrl, preferCityLookup }) {
             geocodingUrl.searchParams.set(key, value);
         }
 
-        const response = await gotScraping({
-            url: geocodingUrl.toString(),
-            method: 'GET',
-            proxyUrl,
-            retry: { limit: 2 },
-            timeout: { request: 30000 },
-            responseType: 'json',
-            headers: {
-                Accept: 'application/json',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'User-Agent': GEOCODER_USER_AGENT,
-            },
-        });
-
-        return Array.isArray(response.body) ? response.body[0] : undefined;
+        const response = await fetchJson(client, geocodingUrl.toString());
+        return Array.isArray(response) ? response[0] : undefined;
     };
 
     try {
@@ -324,137 +309,114 @@ function parseBoundingBox(rawBoundingBox) {
     return { south, north, west, east };
 }
 
-async function resolveLocationFromBrowser(pageUrl, proxyUrl) {
-    let browser;
-
-    try {
-        browser = await firefox.launch({
-            headless: true,
-            proxy: toPlaywrightProxy(proxyUrl),
-        });
-
-        const context = await browser.newContext({
-            locale: 'en-US',
-            userAgent: randomUserAgent(),
-            viewport: { width: 1440, height: 960 },
-        });
-        const page = await context.newPage();
-        await installRequestBlocker(page);
-
-        const listingResponsePromise = page.waitForResponse((response) => {
-            return response.url().includes('/dapi/restaurants/list/v5') && response.status() === 200;
-        }, { timeout: 45000 });
-
-        await page.goto(pageUrl, { timeout: 45000, waitUntil: 'domcontentloaded' });
-        const listingResponse = await listingResponsePromise;
-        const listingPayload = await listingResponse.json();
-        const metaContext = extractMetaContext(listingPayload);
-
-        if (!metaContext?.lat || !metaContext?.lng || !metaContext?.citySlug) {
-            return undefined;
-        }
-
-        return {
-            cityName: metaContext.pageContext?.cityName || unslugifyCityName(metaContext.citySlug),
-            citySlug: metaContext.citySlug,
-            lat: Number(metaContext.lat),
-            lng: Number(metaContext.lng),
-        };
-    } catch (error) {
-        log.warning(`Browser-assisted location resolution failed: ${error.message}`);
-        return undefined;
-    } finally {
-        if (browser) {
-            await browser.close();
-        }
-    }
-}
-
-async function fetchKeywordResults({ keyword, maxPages, resultsWanted, proxyUrl, refererUrl, resolvedLocation }) {
+async function fetchKeywordResults({ keyword, maxPages, resultsWanted, client, refererUrl, resolvedLocation }) {
     const restaurantMap = new Map();
+    const searchTargets = buildCoordinateTargets(resolvedLocation, maxPages, true);
 
-    const restaurantPayload = await fetchJson(
-        buildSearchUrl({ keyword, resolvedLocation, selectedTab: 'RESTAURANT' }),
-        proxyUrl,
-        refererUrl,
-    );
-    const restaurantCards = collectSearchRestaurantCards(restaurantPayload);
-    if (!restaurantCards.length) {
-        log.warning(`No restaurant cards found in keyword response. Response shape: ${describePayloadShape(restaurantPayload)}`);
-    }
-
-    for (const restaurantCard of restaurantCards) {
-        const restaurantInfo = restaurantCard?.card?.card?.info;
-        if (!restaurantInfo?.id || restaurantMap.has(restaurantInfo.id)) continue;
-
-        restaurantMap.set(restaurantInfo.id, mapRestaurantRecord({
-            cityName: resolvedLocation.cityName,
-            citySlug: restaurantInfo.slugs?.city || resolvedLocation.citySlug,
-            contextLabel: 'keyword_search',
-            restaurantCard: restaurantCard.card.card,
-        }));
-
+    for (const coordinateTarget of searchTargets) {
         if (restaurantMap.size >= resultsWanted) break;
-    }
 
-    let dishPayload;
-    try {
-        dishPayload = await fetchJson(
-            buildSearchUrl({ keyword, resolvedLocation, selectedTab: 'DISH' }),
-            proxyUrl,
-            refererUrl,
-        );
-    } catch (error) {
-        log.warning(`Dish enrichment request failed; continuing with restaurant matches only: ${error.message}`);
-    }
+        let restaurantPayload;
+        try {
+            restaurantPayload = await fetchJson(
+                client,
+                buildSearchUrl({ keyword, resolvedLocation, selectedTab: 'RESTAURANT', coordinateTarget }),
+                refererUrl,
+            );
+        } catch (error) {
+            log.warning(`Restaurant search failed for coordinate ${coordinateTarget.lat},${coordinateTarget.lng}; continuing: ${error.message}`);
+            continue;
+        }
 
-    const dishCards = collectSearchDishCards(dishPayload);
-    if (dishPayload && !dishCards.length) {
-        log.info(`No dish cards found in keyword enrichment response. Response shape: ${describePayloadShape(dishPayload)}`);
-    }
+        const restaurantCards = collectSearchRestaurantCards(restaurantPayload);
+        if (!restaurantCards.length) {
+            log.warning(`No restaurant cards found for keyword coordinate ${coordinateTarget.lat},${coordinateTarget.lng}. Response shape: ${describePayloadShape(restaurantPayload)}`);
+        }
 
-    for (const dishCard of dishCards) {
-        const restaurantInfo = dishCard?.card?.card?.restaurant?.info;
-        if (!restaurantInfo?.id) continue;
+        for (const restaurantCard of restaurantCards) {
+            try {
+                const restaurantInfo = restaurantCard?.card?.card?.info;
+                const restaurantId = normalizeRestaurantId(restaurantInfo?.id);
+                if (!restaurantId || restaurantMap.has(restaurantId)) continue;
 
-        const mappedRestaurant = restaurantMap.get(restaurantInfo.id)
-            || mapRestaurantRecord({
-                cityName: resolvedLocation.cityName,
-                citySlug: restaurantInfo.slugs?.city || resolvedLocation.citySlug,
-                contextLabel: 'keyword_search',
-                restaurantCard: dishCard.card.card.restaurant,
-            });
-
-        const dishInfo = dishCard.card?.card?.info;
-        if (dishInfo) {
-            mappedRestaurant.matchedDishes = mappedRestaurant.matchedDishes || [];
-            if (mappedRestaurant.matchedDishes.length < 5) {
-                mappedRestaurant.matchedDishes.push(sanitizeRecord({
-                    name: dishInfo.name,
-                    category: dishInfo.category,
-                    description: dishInfo.description,
-                    imageId: dishInfo.imageId,
-                    imageUrl: toImageUrl(dishInfo.imageId),
-                    inStock: dishInfo.inStock === 1,
-                    isVeg: dishInfo.isVeg === 1,
-                    price: toCurrencyString(dishInfo.price),
-                    finalPrice: toCurrencyString(dishInfo.finalPrice),
-                    rating: dishInfo.ratings?.aggregatedRating?.rating,
-                    ratingCount: dishInfo.ratings?.aggregatedRating?.ratingCountV2 || dishInfo.ratings?.aggregatedRating?.ratingCount,
+                restaurantMap.set(restaurantId, mapRestaurantRecord({
+                    cityName: resolvedLocation.cityName,
+                    citySlug: restaurantInfo.slugs?.city || resolvedLocation.citySlug,
+                    contextLabel: 'keyword_search',
+                    restaurantCard: restaurantCard.card.card,
                 }));
+
+                if (restaurantMap.size >= resultsWanted) break;
+            } catch (error) {
+                log.warning(`Skipping malformed restaurant card: ${error.message}`);
             }
         }
+    }
 
-        restaurantMap.set(restaurantInfo.id, sanitizeRecord(mappedRestaurant));
-        if (restaurantMap.size >= resultsWanted) break;
+    if (restaurantMap.size < resultsWanted) {
+        let dishPayload;
+        try {
+            dishPayload = await fetchJson(
+                client,
+                buildSearchUrl({ keyword, resolvedLocation, selectedTab: 'DISH' }),
+                refererUrl,
+            );
+        } catch (error) {
+            log.warning(`Dish enrichment request failed; continuing with restaurant matches only: ${error.message}`);
+        }
+
+        const dishCards = collectSearchDishCards(dishPayload);
+        if (dishPayload && !dishCards.length) {
+            log.info(`No dish cards found in keyword enrichment response. Response shape: ${describePayloadShape(dishPayload)}`);
+        }
+
+        for (const dishCard of dishCards) {
+            try {
+                const restaurantInfo = dishCard?.card?.card?.restaurant?.info;
+                const restaurantId = normalizeRestaurantId(restaurantInfo?.id);
+                if (!restaurantId) continue;
+
+                const mappedRestaurant = restaurantMap.get(restaurantId)
+                    || mapRestaurantRecord({
+                        cityName: resolvedLocation.cityName,
+                        citySlug: restaurantInfo.slugs?.city || resolvedLocation.citySlug,
+                        contextLabel: 'keyword_search',
+                        restaurantCard: dishCard.card.card.restaurant,
+                    });
+
+                const dishInfo = dishCard.card?.card?.info;
+                if (dishInfo) {
+                    mappedRestaurant.matchedDishes = mappedRestaurant.matchedDishes || [];
+                    if (mappedRestaurant.matchedDishes.length < 5) {
+                        mappedRestaurant.matchedDishes.push(sanitizeRecord({
+                            name: dishInfo.name,
+                            category: dishInfo.category,
+                            description: dishInfo.description,
+                            imageId: dishInfo.imageId,
+                            imageUrl: toImageUrl(dishInfo.imageId),
+                            inStock: dishInfo.inStock === 1,
+                            isVeg: dishInfo.isVeg === 1,
+                            price: toCurrencyString(dishInfo.price),
+                            finalPrice: toCurrencyString(dishInfo.finalPrice),
+                            rating: dishInfo.ratings?.aggregatedRating?.rating,
+                            ratingCount: dishInfo.ratings?.aggregatedRating?.ratingCountV2 || dishInfo.ratings?.aggregatedRating?.ratingCount,
+                        }));
+                    }
+                }
+
+                restaurantMap.set(restaurantId, sanitizeRecord(mappedRestaurant));
+                if (restaurantMap.size >= resultsWanted) break;
+            } catch (error) {
+                log.warning(`Skipping malformed dish card: ${error.message}`);
+            }
+        }
     }
 
     if (!restaurantMap.size) {
         log.warning('Keyword search produced no restaurant records; falling back to city listing results for the resolved location.');
         return fetchCityResults({
             maxPages,
-            pageUrl: undefined,
-            proxyUrl,
+            client,
             refererUrl,
             resolvedLocation,
             resultsWanted,
@@ -464,10 +426,10 @@ async function fetchKeywordResults({ keyword, maxPages, resultsWanted, proxyUrl,
     return [...restaurantMap.values()].slice(0, resultsWanted);
 }
 
-function buildSearchUrl({ keyword, resolvedLocation, selectedTab }) {
+function buildSearchUrl({ keyword, resolvedLocation, selectedTab, coordinateTarget }) {
     const endpointUrl = new URL(SWIGGY_SEARCH_ENDPOINT);
-    endpointUrl.searchParams.set('lat', String(resolvedLocation.lat));
-    endpointUrl.searchParams.set('lng', String(resolvedLocation.lng));
+    endpointUrl.searchParams.set('lat', String(coordinateTarget?.lat ?? resolvedLocation.lat));
+    endpointUrl.searchParams.set('lng', String(coordinateTarget?.lng ?? resolvedLocation.lng));
     endpointUrl.searchParams.set('str', keyword);
     endpointUrl.searchParams.set('trackingId', 'undefined');
     endpointUrl.searchParams.set('submitAction', 'ENTER');
@@ -475,49 +437,32 @@ function buildSearchUrl({ keyword, resolvedLocation, selectedTab }) {
     return endpointUrl.toString();
 }
 
-async function fetchCityResults({ maxPages, pageUrl, proxyUrl, refererUrl, resolvedLocation, resultsWanted }) {
+async function fetchCityResults({ maxPages, client, refererUrl, resolvedLocation, resultsWanted }) {
     const collectedRecords = [];
     const seenRestaurantIds = new Set();
 
-    const coordinateTargets = buildCoordinateTargets(resolvedLocation, maxPages);
-    for (const coordinateTarget of coordinateTargets) {
-        const listingPayload = await fetchJson(
-            buildListingUrl(coordinateTarget.lat, coordinateTarget.lng),
-            proxyUrl,
-            refererUrl,
-        );
-
-        addRestaurantBatch({
-            collectedRecords,
-            contextLabel: 'city_listing',
-            restaurantCards: collectListingCards(listingPayload),
-            seenRestaurantIds,
-            cityName: resolvedLocation.cityName,
-            citySlug: resolvedLocation.citySlug,
-        });
-
-        if (collectedRecords.length >= resultsWanted) {
-            return collectedRecords.slice(0, resultsWanted);
-        }
-
-        const pageOffset = extractPageOffset(listingPayload);
-        if (!pageOffset?.nextOffset) {
+    for (const coordinateTarget of buildCoordinateTargets(resolvedLocation, maxPages)) {
+        let listingPayload;
+        try {
+            listingPayload = await fetchJson(
+                client,
+                buildListingUrl(coordinateTarget.lat, coordinateTarget.lng),
+                refererUrl,
+            );
+        } catch (error) {
+            log.warning(`Listing request failed for coordinate ${coordinateTarget.lat},${coordinateTarget.lng}; skipping it: ${error.message}`);
             continue;
         }
 
-        const offsetListingPayload = await fetchJson(
-            buildListingUrl(coordinateTarget.lat, coordinateTarget.lng, {
-                offset: pageOffset.nextOffset,
-                widgetOffset: pageOffset.widgetOffset,
-            }),
-            proxyUrl,
-            refererUrl,
-        );
+        const listingCards = collectListingCards(listingPayload);
+        if (!listingCards.length) {
+            log.warning(`No restaurant cards found for coordinate ${coordinateTarget.lat},${coordinateTarget.lng}. Response shape: ${describePayloadShape(listingPayload)}`);
+        }
 
         addRestaurantBatch({
             collectedRecords,
             contextLabel: 'city_listing',
-            restaurantCards: collectListingCards(offsetListingPayload),
+            restaurantCards: listingCards,
             seenRestaurantIds,
             cityName: resolvedLocation.cityName,
             citySlug: resolvedLocation.citySlug,
@@ -526,185 +471,113 @@ async function fetchCityResults({ maxPages, pageUrl, proxyUrl, refererUrl, resol
         if (collectedRecords.length >= resultsWanted) {
             return collectedRecords.slice(0, resultsWanted);
         }
-    }
-
-    const shouldUseBrowserPagination = Boolean(
-        pageUrl
-        && collectedRecords.length < resultsWanted
-        && process.env.SWIGGY_ENABLE_BROWSER_PAGINATION === '1',
-    );
-
-    if (!shouldUseBrowserPagination) {
-        return collectedRecords.slice(0, resultsWanted);
-    }
-
-    const browserRecords = await fetchCityResultsInBrowser({
-        maxPages,
-        pageUrl,
-        proxyUrl,
-        resultsWanted,
-        seenRestaurantIds,
-    });
-
-    for (const record of browserRecords) {
-        if (seenRestaurantIds.has(record.restaurantId)) continue;
-        seenRestaurantIds.add(record.restaurantId);
-        collectedRecords.push(record);
-        if (collectedRecords.length >= resultsWanted) break;
     }
 
     return collectedRecords.slice(0, resultsWanted);
 }
 
-async function fetchCityResultsInBrowser({ maxPages, pageUrl, proxyUrl, resultsWanted, seenRestaurantIds }) {
-    let browser;
-
-    try {
-        browser = await firefox.launch({
-            headless: true,
-            proxy: toPlaywrightProxy(proxyUrl),
-        });
-
-        const context = await browser.newContext({
-            locale: 'en-US',
-            userAgent: randomUserAgent(),
-            viewport: { width: 1440, height: 960 },
-        });
-        const page = await context.newPage();
-        await installRequestBlocker(page);
-
-        const responseQueue = [];
-        page.on('response', async (response) => {
-            const contentType = response.headers()['content-type'] || '';
-            if (!response.url().includes('/dapi/restaurants/list/') || !contentType.includes('application/json')) return;
-
-            try {
-                responseQueue.push({
-                    json: await response.json(),
-                    url: response.url(),
-                });
-            } catch {
-                log.warning(`Could not parse JSON from ${response.url()}`);
-            }
-        });
-
-        await page.goto(pageUrl, { timeout: 45000, waitUntil: 'domcontentloaded' });
-        await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-
-        const collectedRecords = [];
-        const browserSeenRestaurantIds = new Set(seenRestaurantIds);
-
-        consumeQueuedListingResponses({
-            collectedRecords,
-            contextLabel: 'city_listing',
-            responseQueue,
-            seenRestaurantIds: browserSeenRestaurantIds,
-        });
-
-        for (let pageIndex = 2; pageIndex <= maxPages && seenRestaurantIds.size + collectedRecords.length < resultsWanted; pageIndex++) {
-            const showMoreButton = page.getByText('Show More', { exact: true });
-            const isVisible = await showMoreButton.isVisible().catch(() => false);
-            if (!isVisible) break;
-
-            const updateResponsePromise = page.waitForResponse((response) => {
-                return response.url().includes('/dapi/restaurants/list/') && response.status() === 200;
-            }, { timeout: 20000 }).catch(() => null);
-
-            await showMoreButton.scrollIntoViewIfNeeded().catch(() => {});
-            await showMoreButton.click({ timeout: 5000 });
-            await updateResponsePromise;
-            await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-
-            consumeQueuedListingResponses({
-                collectedRecords,
-                contextLabel: 'city_listing',
-                responseQueue,
-                seenRestaurantIds: browserSeenRestaurantIds,
-            });
-        }
-
-        return collectedRecords.slice(0, resultsWanted);
-    } catch (error) {
-        log.warning(`Browser-assisted pagination failed: ${error.message}`);
-        return [];
-    } finally {
-        if (browser) {
-            await browser.close();
-        }
-    }
-}
-
-function consumeQueuedListingResponses({
-    collectedRecords,
-    contextLabel,
-    responseQueue,
-    seenRestaurantIds,
-}) {
-    while (responseQueue.length) {
-        const responseEntry = responseQueue.shift();
-
-        const metaContext = extractMetaContext(responseEntry.json);
-        const cityName = metaContext?.pageContext?.cityName || unslugifyCityName(metaContext?.citySlug || '');
-        const citySlug = metaContext?.citySlug || slugifyCityName(cityName);
-
-        addRestaurantBatch({
-            collectedRecords,
-            contextLabel,
-            restaurantCards: collectListingCards(responseEntry.json),
-            seenRestaurantIds,
-            cityName,
-            citySlug,
-        });
-    }
-}
-
 function addRestaurantBatch({ collectedRecords, contextLabel, restaurantCards, seenRestaurantIds, cityName, citySlug }) {
     for (const restaurantCard of restaurantCards) {
-        const mappedRecord = mapRestaurantRecord({ cityName, citySlug, contextLabel, restaurantCard });
-        if (!mappedRecord.restaurantId || seenRestaurantIds.has(mappedRecord.restaurantId)) continue;
+        try {
+            const mappedRecord = mapRestaurantRecord({ cityName, citySlug, contextLabel, restaurantCard });
+            if (!mappedRecord?.restaurantId || seenRestaurantIds.has(mappedRecord.restaurantId)) continue;
 
-        seenRestaurantIds.add(mappedRecord.restaurantId);
-        collectedRecords.push(mappedRecord);
+            seenRestaurantIds.add(mappedRecord.restaurantId);
+            collectedRecords.push(mappedRecord);
+        } catch (error) {
+            log.warning(`Skipping malformed restaurant card: ${error.message}`);
+        }
     }
 }
 
-async function fetchJson(url, proxyUrl, refererUrl) {
+async function fetchJson(client, url, refererUrl) {
     let lastError;
 
-    for (const headerProfile of BROWSER_HEADER_PROFILES) {
+    for (let attempt = 1; attempt <= MAX_REQUEST_ATTEMPTS; attempt++) {
         try {
-            const response = await gotScraping({
-                url,
+            const response = await client.fetch(url, {
                 method: 'GET',
-                proxyUrl,
-                retry: { limit: 1 },
-                timeout: { request: 30000 },
-                responseType: 'json',
-                headers: {
-                    Accept: 'application/json, text/plain, */*',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    Origin: SWIGGY_BASE_URL,
-                    Referer: refererUrl,
-                    ...headerProfile,
-                },
+                signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+                ...(refererUrl && {
+                    headers: {
+                        Origin: SWIGGY_BASE_URL,
+                        Referer: refererUrl,
+                    },
+                }),
             });
 
-            return response.body;
+            if (!response.ok) {
+                const error = new Error(`HTTP ${response.status}`);
+                error.statusCode = response.status;
+                error.retryAfterMs = getRetryAfterMs(response);
+                throw error;
+            }
+
+            const payload = await response.json();
+            if (!payload || typeof payload !== 'object') {
+                throw new Error('Unexpected JSON response shape.');
+            }
+
+            return payload;
         } catch (error) {
             lastError = error;
-            const statusCode = error.response?.statusCode;
+            const statusCode = error.statusCode || error.response?.status;
             log.warning(`Request failed for ${new URL(url).pathname}${statusCode ? ` with HTTP ${statusCode}` : ''}: ${error.message}`);
+
+            if (attempt < MAX_REQUEST_ATTEMPTS && isRetryableRequestError(error)) {
+                const delayMs = getRetryDelayMs(error, attempt);
+                log.info(`Retrying request in ${delayMs}ms (attempt ${attempt + 1}/${MAX_REQUEST_ATTEMPTS}).`);
+                await new Promise((resolve) => {
+                    setTimeout(resolve, delayMs);
+                });
+            } else {
+                break;
+            }
         }
     }
 
     throw lastError;
 }
 
-function extractPageOffset(payload) {
-    return payload?.data?.pageOffset;
+function isRetryableRequestError(error) {
+    const statusCode = error.statusCode || error.response?.status;
+    if (!statusCode) return true;
+
+    return statusCode === 403
+        || statusCode === 408
+        || statusCode === 425
+        || statusCode === 429
+        || statusCode >= 500;
 }
 
-function buildCoordinateTargets(resolvedLocation, maxPages) {
+function getRetryDelayMs(error, attempt) {
+    if (Number.isFinite(error.retryAfterMs)) {
+        return Math.min(Math.max(error.retryAfterMs, 0), MAX_RETRY_DELAY_MS);
+    }
+
+    const statusCode = error.statusCode || error.response?.status;
+    let baseDelayMs = 500;
+    if (statusCode === 429) {
+        baseDelayMs = 2000;
+    } else if (statusCode >= 500) {
+        baseDelayMs = 1000;
+    }
+
+    return Math.min(attempt * baseDelayMs, MAX_RETRY_DELAY_MS);
+}
+
+function getRetryAfterMs(response) {
+    const retryAfter = response.headers?.get?.('retry-after');
+    if (!retryAfter) return undefined;
+
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds)) return seconds * 1000;
+
+    const retryAt = Date.parse(retryAfter);
+    return Number.isFinite(retryAt) ? retryAt - Date.now() : undefined;
+}
+
+function buildCoordinateTargets(resolvedLocation, maxPages, prioritizeCoverage = false) {
     const targets = [{ lat: resolvedLocation.lat, lng: resolvedLocation.lng }];
     const { boundingBox } = resolvedLocation;
 
@@ -714,17 +587,29 @@ function buildCoordinateTargets(resolvedLocation, maxPages) {
 
     const centerLat = (boundingBox.south + boundingBox.north) / 2;
     const centerLng = (boundingBox.west + boundingBox.east) / 2;
-    const candidateTargets = [
-        { lat: centerLat, lng: centerLng },
-        { lat: boundingBox.south, lng: boundingBox.west },
-        { lat: boundingBox.south, lng: boundingBox.east },
-        { lat: boundingBox.north, lng: boundingBox.west },
-        { lat: boundingBox.north, lng: boundingBox.east },
-        { lat: boundingBox.south, lng: centerLng },
-        { lat: boundingBox.north, lng: centerLng },
-        { lat: centerLat, lng: boundingBox.west },
-        { lat: centerLat, lng: boundingBox.east },
-    ];
+    const candidateTargets = prioritizeCoverage
+        ? [
+            { lat: boundingBox.south, lng: boundingBox.west },
+            { lat: boundingBox.south, lng: boundingBox.east },
+            { lat: boundingBox.north, lng: boundingBox.west },
+            { lat: boundingBox.north, lng: boundingBox.east },
+            { lat: centerLat, lng: centerLng },
+            { lat: boundingBox.south, lng: centerLng },
+            { lat: boundingBox.north, lng: centerLng },
+            { lat: centerLat, lng: boundingBox.west },
+            { lat: centerLat, lng: boundingBox.east },
+        ]
+        : [
+            { lat: centerLat, lng: centerLng },
+            { lat: boundingBox.south, lng: boundingBox.west },
+            { lat: boundingBox.south, lng: boundingBox.east },
+            { lat: boundingBox.north, lng: boundingBox.west },
+            { lat: boundingBox.north, lng: boundingBox.east },
+            { lat: boundingBox.south, lng: centerLng },
+            { lat: boundingBox.north, lng: centerLng },
+            { lat: centerLat, lng: boundingBox.west },
+            { lat: centerLat, lng: boundingBox.east },
+        ];
 
     const seenTargets = new Set([toCoordinateKey(resolvedLocation.lat, resolvedLocation.lng)]);
     for (const candidateTarget of candidateTargets) {
@@ -743,21 +628,12 @@ function toCoordinateKey(lat, lng) {
     return `${Number(lat).toFixed(4)}:${Number(lng).toFixed(4)}`;
 }
 
-function buildListingUrl(lat, lng, options = {}) {
+function buildListingUrl(lat, lng) {
     const listingUrl = new URL(SWIGGY_LISTING_ENDPOINT);
     listingUrl.searchParams.set('lat', String(lat));
     listingUrl.searchParams.set('lng', String(lng));
     listingUrl.searchParams.set('is-seo-homepage-enabled', 'true');
     listingUrl.searchParams.set('page_type', 'DESKTOP_WEB_LISTING');
-
-    if (options.offset) {
-        listingUrl.searchParams.set('offset', options.offset);
-    }
-
-    if (options.widgetOffset && typeof options.widgetOffset === 'object') {
-        listingUrl.searchParams.set('widget_offset', JSON.stringify(options.widgetOffset));
-    }
-
     return listingUrl.toString();
 }
 
@@ -766,8 +642,9 @@ function buildCityUrl(citySlug) {
 }
 
 function collectListingCards(payload) {
-    const mainGridCards = payload?.data?.cards
-        ?.filter((card) => card?.card?.card?.id === 'restaurant_grid_listing_v2')
+    const cards = getResponseCards(payload);
+    const mainGridCards = cards
+        .filter((card) => card?.card?.card?.id === 'restaurant_grid_listing_v2')
         .flatMap((card) => card.card.card.gridElements?.infoWithStyle?.restaurants || []);
 
     if (mainGridCards?.length) {
@@ -789,7 +666,7 @@ function collectListingCards(payload) {
 
 function collectSearchDishCards(payload) {
     const dishCards = [];
-    visitValue(payload?.data?.cards, (value) => {
+    visitValue(getResponseCards(payload), (value) => {
         if (!Array.isArray(value)) return;
 
         for (const entry of value) {
@@ -805,7 +682,7 @@ function collectSearchDishCards(payload) {
 
 function collectSearchRestaurantCards(payload) {
     const restaurantCards = [];
-    visitValue(payload?.data?.cards, (value) => {
+    visitValue(getResponseCards(payload), (value) => {
         if (!Array.isArray(value)) return;
 
         for (const entry of value) {
@@ -835,11 +712,13 @@ function visitValue(value, visitor) {
 }
 
 function describePayloadShape(payload) {
-    const dataKeys = Object.keys(payload?.data || {});
-    const topLevelCardCount = payload?.data?.cards?.length || 0;
+    const data = getCaseInsensitiveProperty(payload, 'data');
+    const cards = getResponseCards(payload);
+    const dataKeys = data && typeof data === 'object' ? Object.keys(data) : [];
+    const topLevelCardCount = cards.length;
     const groupKeys = new Set();
 
-    visitValue(payload?.data?.cards, (value) => {
+    visitValue(cards, (value) => {
         if (value?.cardGroupMap && typeof value.cardGroupMap === 'object') {
             for (const key of Object.keys(value.cardGroupMap)) {
                 groupKeys.add(key);
@@ -848,22 +727,31 @@ function describePayloadShape(payload) {
     });
 
     return JSON.stringify({
-        topLevelKeys: Object.keys(payload || {}),
+        topLevelKeys: payload && typeof payload === 'object' ? Object.keys(payload) : [],
         dataKeys,
         topLevelCardCount,
         groupKeys: [...groupKeys],
     });
 }
 
-function extractMetaContext(payload) {
-    let metaContext;
-    visitValue(payload?.data?.cards, (value) => {
-        if (metaContext || !value || typeof value !== 'object') return;
-        if (value['@type'] === 'type.googleapis.com/swiggy.seo.widgets.v1.MetaContext') {
-            metaContext = value;
-        }
-    });
-    return metaContext;
+function getResponseCards(payload) {
+    const data = getCaseInsensitiveProperty(payload, 'data');
+    const cards = getCaseInsensitiveProperty(data, 'cards');
+    return Array.isArray(cards) ? cards : [];
+}
+
+function getCaseInsensitiveProperty(value, key) {
+    if (!value || typeof value !== 'object') return undefined;
+
+    const matchingKey = Object.keys(value).find((candidate) => candidate.toLowerCase() === key.toLowerCase());
+    return matchingKey ? value[matchingKey] : undefined;
+}
+
+function normalizeRestaurantId(value) {
+    if (value === null || value === undefined) return undefined;
+
+    const normalizedId = String(value).trim();
+    return normalizedId || undefined;
 }
 
 function mapRestaurantRecord({ cityName, citySlug, contextLabel, restaurantCard }) {
@@ -873,7 +761,7 @@ function mapRestaurantRecord({ cityName, citySlug, contextLabel, restaurantCard 
 
     return sanitizeRecord({
         sourceType: contextLabel,
-        restaurantId: String(info.id || ''),
+        restaurantId: normalizeRestaurantId(info.id),
         name: info.name,
         city: cityName,
         citySlug: slugs.city || citySlug,
@@ -974,35 +862,6 @@ function sanitizeRecord(value) {
         .filter(([, nestedValue]) => nestedValue !== undefined);
 
     return sanitizedEntries.length ? Object.fromEntries(sanitizedEntries) : undefined;
-}
-
-async function installRequestBlocker(page) {
-    await page.route('**/*', (route) => {
-        const resourceType = route.request().resourceType();
-        const requestUrl = route.request().url();
-
-        if (['image', 'font', 'media', 'stylesheet'].includes(resourceType)
-            || TRACKER_PATTERNS.some((pattern) => requestUrl.includes(pattern))) {
-            return route.abort();
-        }
-
-        return route.continue();
-    });
-}
-
-function toPlaywrightProxy(proxyUrl) {
-    if (!proxyUrl) return undefined;
-
-    const parsedUrl = new URL(proxyUrl);
-    return {
-        server: `${parsedUrl.protocol}//${parsedUrl.host}`,
-        username: decodeURIComponent(parsedUrl.username),
-        password: decodeURIComponent(parsedUrl.password),
-    };
-}
-
-function randomUserAgent() {
-    return FIREFOX_USER_AGENTS[Math.floor(Math.random() * FIREFOX_USER_AGENTS.length)];
 }
 
 function unslugifyCityName(citySlug) {

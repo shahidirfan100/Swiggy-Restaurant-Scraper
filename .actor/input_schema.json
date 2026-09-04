@@ -37,7 +37,7 @@
         "maxPages": {
             "title": "Max Pages",
             "type": "integer",
-            "description": "Maximum number of Swiggy pages to advance in URL mode when Show More is available.",
+            "description": "Maximum number of bounded coordinate or page expansion attempts used for city and keyword searches.",
             "minimum": 1,
             "default": 3,
             "prefill": 3,
